@@ -1,0 +1,177 @@
+package com.ecommerce.user.security.jwt;
+
+
+import com.ecommerce.user.config.JwtConfig;
+import com.ecommerce.user.enums.TokenType;
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.JwtException;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.io.Decoders;
+import io.jsonwebtoken.security.Keys;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+
+import javax.crypto.SecretKey;
+import java.util.Date;
+import java.util.Map;
+
+
+/**
+ * =====================================================================================
+ * FILE: JwtUtils.java
+ * MODULE: user-service
+ * PURPOSE: Cryptographic engine for creating, signing, parsing, and validating JWT tokens
+ *          using the modern JJWT 0.12.6 API.
+ *
+ * DESIGN PATTERN: Utility Bean (Stateless Component).
+ *
+ * HOW JWT TOKENS WORK UNDER THE HOOD:
+ * A JSON Web Token consists of three parts separated by dots (`.`):
+ *   HEADER . PAYLOAD . SIGNATURE
+ *
+ * 1. HEADER (Base64Url-encoded):
+ *    { "alg": "HS256", "typ": "JWT" }
+ *
+ * 2. PAYLOAD / CLAIMS (Base64Url-encoded JSON):
+ *    {
+ *      "sub": "user@example.com",        // Subject: user identifier
+ *      "iat": 1726214400,                // Issued At timestamp
+ *      "exp": 1726215300,                // Expiration timestamp
+ *      "id": "c1f7a2d4-...",             // Application-specific token identifier
+ *      "roles": ["ROLE_USER"]            // Custom claims (roles, permissions)
+ *    }
+ *
+ * 3. SIGNATURE:
+ *    Calculated as: HMACSHA256(Base64Url(Header) + "." + Base64Url(Payload), secretKey)
+ *    Because the secret key is known ONLY to the server, nobody can change the payload
+ *    (e.g., tamper with their user ID or role) without causing the signature verification to FAIL!
+ * =====================================================================================
+ */
+
+@Component
+@Slf4j
+public class JwtUtils {
+
+    // Injected type-safe configuration containing secrets and expiration minutes for each token type
+    private final JwtConfig jwtConfig;
+
+    // Injected RSA 2048-bit key provider for asymmetric RS256 cryptographic operations
+    private final RsaKeyProvider rsaKeyProvider;
+
+    public JwtUtils(JwtConfig jwtConfig, RsaKeyProvider rsaKeyProvider) {
+        this.jwtConfig = jwtConfig;
+        this.rsaKeyProvider = rsaKeyProvider;
+    }
+
+
+    public String generateToken(TokenType tokenType, String subject, Map<String,?> claims){
+        // Step 1: Look up the configuration (secret + expiration) for this specific token type
+        JwtConfig.TokenConfig tokenConfig =jwtConfig.getTokenConfigByType(tokenType);
+        // Step 2: Convert expiration from minutes to milliseconds
+        long expirationMillis = tokenConfig.getExpiration() * 60 * 1000;
+
+        // Step 3: Compute current time and future expiration date
+        Date now = new Date();
+        Date expirationDate =new Date(now.getTime() + expirationMillis);
+
+        // Step 4: Use JJWT 0.12.6 fluent builder to assemble the token
+        var builder = Jwts.builder()
+                .subject(subject)
+                .claims(claims)
+                .issuedAt(now)
+                .expiration(expirationDate);
+
+        // Step 5: Asymmetric vs Symmetric Signing Selection
+        if (tokenType == TokenType.ACCESS_TOKEN && rsaKeyProvider != null && rsaKeyProvider.getPrivateKey() != null) {
+            // RS256: Sign with RSA Private Key
+            builder.signWith(rsaKeyProvider.getPrivateKey(), Jwts.SIG.RS256);
+        } else {
+            // HS256: Fall back to Symmetric HMAC-SHA256
+            builder.signWith(getKey(tokenConfig.getSecret()), Jwts.SIG.HS256);
+        }
+
+        // Serializes everything into the final compacted URL-safe string format (xxx.yyy.zzz)
+        return builder.compact();
+    }
+
+
+    /**
+     * Converts a Base64-encoded secret string into a cryptographic HMAC-SHA SecretKey.
+     *
+     * @param base64Secret the Base64 string from application.yml
+     * @return the java.security SecretKey object
+     */
+    private SecretKey getKey(String base64Secret) {
+        // 1. Decode the Base64 string into raw binary bytes
+        byte[] keyBytes = Decoders.BASE64.decode(base64Secret);
+        // 2. Wrap the bytes into a secure HMAC-SHA key representation
+        return Keys.hmacShaKeyFor(keyBytes);
+    }
+
+
+    /**
+     * Parses and cryptographically verifies an incoming token.
+     * Throws JwtException if the signature is invalid, token is tampered, or token has expired.
+     * @param tokenType the expected token scope
+     * @param token the raw JWT string from the request header
+     * @return the Claims payload
+     */
+    public Claims getAllClaimsFromToken(TokenType tokenType,String token){
+
+        // Build the JJWT parser based on the cryptographic algorithm for this token type
+        if (tokenType == TokenType.ACCESS_TOKEN &&  rsaKeyProvider != null  && rsaKeyProvider.getPublicKey() != null){
+            // RS256: Verify using the RSA Public Key
+            return Jwts.parser()
+                    .verifyWith(rsaKeyProvider.getPublicKey())
+                    .build()
+                    .parseSignedClaims(token)
+                    .getPayload();
+        }else {
+            // HS256: Verify using the Symmetric Secret Key
+
+            JwtConfig.TokenConfig tokenConfig =jwtConfig.getTokenConfigByType(tokenType);
+
+            return Jwts.parser()
+                    .verifyWith(getKey(tokenConfig.getSecret()))
+                    .build()
+                    .parseSignedClaims(token)
+                    .getPayload();
+        }
+
+    }
+
+    /**
+     * Validates whether a token is valid, un-tampered, and currently active.
+     * @return true if token is valid, false if signature check fails or token is expired
+     */
+
+    public boolean validateToken(TokenType tokenType,String token){
+
+        try {
+            // Attempt to parse claims. If valid, no exception is thrown
+            getAllClaimsFromToken(tokenType, token);
+            return true;
+        } catch (JwtException | IllegalArgumentException e) {
+            // Catches ExpiredJwtException, MalformedJwtException, SignatureException
+            log.warn("Invalid JWT token [{}]: {}", tokenType, e.getMessage());
+            return false;
+        }
+    }
+
+    public String getSubject(TokenType tokenType,String token){
+
+        return getAllClaimsFromToken(tokenType,token).getSubject();
+    }
+
+
+    /**
+     * Helper to extract standard claims map (subject and token UUID).
+     */
+    public Map<String, String> getClaimsFromToken(TokenType tokenType, String token) {
+        Claims claims = getAllClaimsFromToken(tokenType, token);
+        return Map.of(
+                "subject", claims.getSubject(),
+                "id", claims.get("id") != null ? claims.get("id").toString() : ""
+        );
+    }
+}
