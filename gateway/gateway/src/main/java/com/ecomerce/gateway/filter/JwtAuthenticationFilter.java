@@ -29,7 +29,6 @@ import reactor.core.publisher.Mono;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 
-
 /**
  * =====================================================================================
  * FILE: JwtAuthenticationFilter.java
@@ -97,12 +96,11 @@ import java.util.List;
 @Component
 @RequiredArgsConstructor
 @Slf4j
-public class JwtAuthenticationFilter  implements GlobalFilter, Ordered {
+public class JwtAuthenticationFilter implements GlobalFilter, Ordered {
 
     private final RsaKeyProvider rsaKeyProvider;
     private final ReactiveStringRedisTemplate redisTemplate;
     private final ObjectMapper objectMapper = new ObjectMapper();
-
 
     // Whitelist of public endpoints that bypass JWT verification
     private static final List<String> PUBLIC_WHITELIST = List.of(
@@ -139,19 +137,29 @@ public class JwtAuthenticationFilter  implements GlobalFilter, Ordered {
         String path = exchange.getRequest().getURI().getPath();
         HttpMethod method = exchange.getRequest().getMethod();
 
-        if(isWhitelisted(path)){
+        // 1. Allow CORS pre-flight requests to pass through untouched
+        if (HttpMethod.OPTIONS.equals(method)) {
             return chain.filter(exchange);
         }
 
+        // 2. Allow whitelisted endpoints, but sanitize external caller identity headers
+        if (isWhitelisted(path)) {
+            ServerHttpRequest sanitizedRequest = exchange.getRequest().mutate()
+                    .headers(this::stripUntrustedIdentityHeaders)
+                    .build();
+            return chain.filter(exchange.mutate().request(sanitizedRequest).build());
+        }
+
+        // 3. Validate presence of Bearer Authorization header
         String authHeader = exchange.getRequest().getHeaders().getFirst(HttpHeaders.AUTHORIZATION);
 
-        if (authHeader == null || !authHeader.startsWith("Bearer ")){
-            return onError(exchange,"Missing or malformed Authorization header. Use 'Bearer <token>'",HttpStatus.UNAUTHORIZED);
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            return onError(exchange, "Missing or malformed Authorization header. Use 'Bearer <token>'", HttpStatus.UNAUTHORIZED);
         }
 
         String token = authHeader.substring(7);
 
-
+        // 4. Cryptographic RS256 token verification
         Claims claims;
         try {
             claims = Jwts.parser()
@@ -170,6 +178,7 @@ public class JwtAuthenticationFilter  implements GlobalFilter, Ordered {
             return onError(exchange, "Invalid JWT authentication token", HttpStatus.UNAUTHORIZED);
         }
 
+        // 5. Redis JTI blocklist check for revoked tokens
         // Pure stateless JWTs cannot be revoked before expiration. We solve this by storing
         // revoked token JTIs (JWT IDs) in Redis with a TTL matching token expiry.
         // If the JTI exists in "blocklist:jti:{jti}", the token is immediately rejected.
@@ -177,6 +186,7 @@ public class JwtAuthenticationFilter  implements GlobalFilter, Ordered {
         if (jti != null && !jti.isBlank()) {
             String blocklistKey = "blocklist:jti:" + jti;
             return redisTemplate.hasKey(blocklistKey)
+                    .defaultIfEmpty(false)
                     .flatMap(isRevoked -> {
                         if (Boolean.TRUE.equals(isRevoked)) {
                             log.warn("Rejected revoked token with JTI [{}] on path [{}]", jti, path);
@@ -191,10 +201,8 @@ public class JwtAuthenticationFilter  implements GlobalFilter, Ordered {
                     });
         }
 
-
-        return proceedWithDownstreamHeaders(exchange,chain,claims);
+        return proceedWithDownstreamHeaders(exchange, chain, claims);
     }
-
 
     /**
      * Sanitizes external headers and injects verified cryptographic claims downstream.
@@ -208,10 +216,7 @@ public class JwtAuthenticationFilter  implements GlobalFilter, Ordered {
     private Mono<Void> proceedWithDownstreamHeaders(ServerWebExchange exchange, GatewayFilterChain chain, Claims claims) {
         String userId = claims.get("userId") != null ? claims.get("userId").toString() : "";
         String email = claims.getSubject() != null ? claims.getSubject() : "";
-        Object rolesObj = claims.get("roles");
-        String roles = rolesObj != null ? rolesObj.toString() : "[]";
-
-
+        String roles = serializeRoles(claims.get("roles"));
 
         ServerHttpRequest mutatedRequest = exchange.getRequest().mutate()
                 .headers(headers -> {
@@ -227,6 +232,18 @@ public class JwtAuthenticationFilter  implements GlobalFilter, Ordered {
 
         log.debug("Successfully authenticated request for userId [{}], email [{}]. Mutating downstream headers", userId, email);
         return chain.filter(exchange.mutate().request(mutatedRequest).build());
+    }
+
+    private String serializeRoles(Object rolesObj) {
+        if (rolesObj == null) {
+            return "[]";
+        }
+        try {
+            return objectMapper.writeValueAsString(rolesObj);
+        } catch (JsonProcessingException e) {
+            log.warn("Failed to serialize roles object: {}", e.getMessage());
+            return "[]";
+        }
     }
 
     /**
@@ -250,6 +267,10 @@ public class JwtAuthenticationFilter  implements GlobalFilter, Ordered {
      */
     private Mono<Void> onError(ServerWebExchange exchange, String message, HttpStatus status) {
         ServerHttpResponse response = exchange.getResponse();
+        if (response.isCommitted()) {
+            return Mono.empty();
+        }
+
         response.setStatusCode(status);
         response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
 
